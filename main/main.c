@@ -1,46 +1,38 @@
-// main/main.c —— FoloToy AI Passport BSP 驱动参考示例:初始化 + 菜单 + 按键分发。
-//
-// 按键语义(全局统一):
-//   上/下 短按   菜单中=移动选中项;演示页中=该页自定义
-//   确定  短按   菜单中=进入选中项;演示页中=该页自定义
-//   确定  长按   演示页中=返回菜单(由本文件统一拦截)
-#include "bsp_i2c.h"
-#include "bsp_display.h"
-#include "bsp_button.h"
+#include "app_config.h"
+#include "app_net.h"
+#include "audio_pipeline.h"
 #include "bsp_audio.h"
 #include "bsp_battery.h"
-#include "bsp_pins.h"      // 错误日志里要打印 BSP_LCD_* 引脚号
-#include "demo.h"
-#include "demo_navigation.h"
+#include "bsp_button.h"
+#include "bsp_display.h"
+#include "bsp_i2c.h"
+#include "bsp_pins.h"
+#include "feishu_formatter.h"
+#include "feishu_pusher.h"
 #include "key_guard.h"
-#include "ui_pixel.h"
-#include "lvgl.h"
+#include "meeting_fsm.h"
+#include "memopass_ui.h"
+#include "mp_utf8.h"
+#include "portal_server.h"
+#include "volc_asr_client.h"
+
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_sleep.h"
+#include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "lvgl.h"
 
-static const char *TAG = "main";
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
 
-static const demo_entry_t DEMOS[] = {
-    { .name = "Display", .enter = demo_display_enter, .exit = demo_display_exit,
-      .key = demo_display_key },
-    { .name = "Button", .enter = demo_button_enter, .exit = demo_button_exit,
-      .key = demo_button_key },
-    { .name = "Audio", .enter = demo_audio_enter, .exit = demo_audio_exit,
-      .key = demo_audio_key, .start = demo_audio_start, .stop = demo_audio_stop },
-    { .name = "Battery", .enter = demo_battery_enter, .exit = demo_battery_exit,
-      .key = demo_battery_key },
-    { .name = "Wi-Fi", .enter = demo_wifi_enter, .exit = demo_wifi_exit,
-      .key = demo_wifi_key, .start = demo_wifi_start, .stop = demo_wifi_stop },
-    { .name = "BLE", .enter = demo_ble_enter, .exit = demo_ble_exit,
-      .key = demo_ble_key, .start = demo_ble_start, .stop = demo_ble_stop },
-    { .name = "Low Power", .enter = demo_low_power_enter, .exit = demo_low_power_exit,
-      .key = demo_low_power_key, .start = demo_low_power_start, .stop = demo_low_power_stop },
-};
-#define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
+static const char *TAG = "memopass";
+#define KEY_GUARD_MAX_US (10LL * 1000 * 1000)
 #define INPUT_QUEUE_DEPTH 8
 
 typedef struct {
@@ -48,232 +40,295 @@ typedef struct {
     bsp_btn_ev_t event;
 } input_event_t;
 
-// 各外设初始化结果:失败的项在菜单里标 [FAIL] 且不允许进入。
-static bool s_ok[DEMO_COUNT];
-
-static lv_obj_t *s_menu_scr;
-static lv_obj_t *s_cards[DEMO_COUNT];
-static lv_obj_t *s_rows[DEMO_COUNT];
-static lv_obj_t *s_mascot;
-static demo_navigation_t s_navigation;
-static QueueHandle_t s_input_queue;
-static TaskHandle_t s_input_task;
-static volatile bool s_input_ready;
-
-static void menu_refresh(void) {
-    for (size_t i = 0; i < DEMO_COUNT; i++) {
-        lv_label_set_text_fmt(s_rows[i], "%s%s",
-                              DEMOS[i].name,
-                              s_ok[i] ? "" : "  [FAIL]");
-        ui_pixel_set_selected(s_cards[i], i == s_navigation.selected, s_ok[i]);
-        lv_obj_set_style_text_color(s_rows[i],
-            s_ok[i] ? lv_color_hex(UI_INK) : lv_color_hex(0x7A2020), 0);
-    }
-}
-
-static void menu_build(void) {
-    s_menu_scr = ui_pixel_screen_create("FoloToy");
-
-    for (size_t i = 0; i < DEMO_COUNT; i++) {
-        int x = 11 + (int)(i % 2) * 112;
-        int y = 52 + (int)(i / 2) * 47;
-        s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, 102, 40, UI_PAPER);
-        s_rows[i] = lv_label_create(s_cards[i]);
-        lv_obj_set_style_text_font(s_rows[i], &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_align(s_rows[i], LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_center(s_rows[i]);
-    }
-
-    s_mascot = ui_pixel_mascot_create(s_menu_scr, 101, 242);
-
-    menu_refresh();
-    lv_screen_load(s_menu_scr);
-}
-
-static void enter_menu(void) {
-    menu_build();
-}
-
-static demo_nav_input_t navigation_input(bsp_btn_t btn, bsp_btn_ev_t event) {
-    if (event == BSP_BTN_LONG && btn == BSP_BTN_OK) return DEMO_NAV_INPUT_OK_LONG;
-    if (event != BSP_BTN_CLICK) return DEMO_NAV_INPUT_OTHER;
-    if (btn == BSP_BTN_UP) return DEMO_NAV_INPUT_UP_CLICK;
-    if (btn == BSP_BTN_DOWN) return DEMO_NAV_INPUT_DOWN_CLICK;
-    if (btn == BSP_BTN_OK) return DEMO_NAV_INPUT_OK_CLICK;
-    return DEMO_NAV_INPUT_OTHER;
-}
-
-static void process_input(const input_event_t *input) {
-    demo_nav_input_t nav_input = navigation_input(input->btn, input->event);
-
-    if (s_navigation.active >= 0) {
-        demo_nav_result_t result = demo_navigation_handle(&s_navigation, nav_input, true);
-        const demo_entry_t *demo = &DEMOS[result.index];
-        if (result.action == DEMO_NAV_ACTION_EXIT) {
-            esp_err_t e = demo->stop ? demo->stop() : ESP_OK;
-            if (e != ESP_OK) {
-                ESP_LOGE(TAG, "%s 页面停止失败: %s", demo->name, esp_err_to_name(e));
-                return;
-            }
-            if (!bsp_lvgl_lock(500)) return;
-            demo->exit();
-            demo_navigation_complete_exit(&s_navigation);
-            enter_menu();
-            bsp_lvgl_unlock();
-        } else if (result.action == DEMO_NAV_ACTION_FORWARD) {
-            demo->key(input->btn, input->event);
-        }
-        return;
-    }
-
-    if (nav_input == DEMO_NAV_INPUT_OTHER || nav_input == DEMO_NAV_INPUT_OK_LONG) return;
-    if (!bsp_lvgl_lock(500)) return;
-    demo_nav_result_t result = demo_navigation_handle(
-        &s_navigation, nav_input, s_ok[s_navigation.selected]);
-    if (result.action == DEMO_NAV_ACTION_REFRESH) {
-        menu_refresh();
-        ui_pixel_mascot_jump(s_mascot);
-    } else if (result.action == DEMO_NAV_ACTION_ENTER) {
-        const demo_entry_t *demo = &DEMOS[result.index];
-        ui_pixel_mascot_jump(s_mascot);
-        lv_obj_delete(s_menu_scr);
-        s_menu_scr = NULL;
-        s_mascot = NULL;
-        demo->enter();
-        bsp_lvgl_unlock();
-
-        esp_err_t e = demo->start ? demo->start() : ESP_OK;
-        if (e != ESP_OK) {
-            ESP_LOGE(TAG, "%s 页面启动失败: %s", demo->name, esp_err_to_name(e));
-        }
-        return;
-    }
-    bsp_lvgl_unlock();
-}
-
-static void input_task(void *arg) {
-    (void)arg;
-    input_event_t input;
-    for (;;) {
-        if (xQueueReceive(s_input_queue, &input, portMAX_DELAY) == pdTRUE) {
-            process_input(&input);
-        }
-    }
-}
-
-static esp_err_t input_dispatch_init(void) {
-    s_input_queue = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(input_event_t));
-    if (!s_input_queue) return ESP_ERR_NO_MEM;
-    if (xTaskCreate(input_task, "demo_input", 4096, NULL, 5, &s_input_task) != pdPASS) {
-        vQueueDelete(s_input_queue);
-        s_input_queue = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    return ESP_OK;
-}
-
-static void input_dispatch_deinit(void) {
-    s_input_ready = false;
-    if (s_input_task) {
-        vTaskDelete(s_input_task);
-        s_input_task = NULL;
-    }
-    if (s_input_queue) {
-        vQueueDelete(s_input_queue);
-        s_input_queue = NULL;
-    }
-}
-
-// Waking from deep sleep by key reboots the chip while that key is still held: the
-// button component starts a few hundred milliseconds later, registers a press that
-// is already down, and grades it a long press once it has been down for its
-// threshold (500 ms here), so an unintended action fires almost immediately. Drop
-// key actions until that press comes up; the deadline is only a safety net so a
-// stuck key cannot leave the pad dead. The state machine lives in key_guard.h so it
-// can be unit-tested without the rest of the demo.
-#define KEY_GUARD_MAX_US (10LL * 1000 * 1000)
 static key_guard_t s_key_guard;
+static QueueHandle_t s_input_queue;
+static volatile bool s_input_ready;
+static meeting_fsm_t s_fsm;
+static app_config_t s_cfg;
+static volatile bool s_paused;
+static volatile bool s_muted;
+static volatile bool s_session_run;
+static volatile bool s_holding;
+static volatile int64_t s_hold_start;
+static volatile bool s_hold_fired;
+static char s_detail[96];
+static int s_segments;
+static uint32_t s_elapsed_ms;
+static char s_meeting_id[12];
+static uint8_t s_pcm[3][AUDIO_PCM_BYTES];
+static QueueHandle_t s_pcm_used;
+static QueueHandle_t s_pcm_free;
 
-// button callbacks run on the shared esp_timer task; enqueue only and return immediately.
 static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
     (void)user;
-    // Consume the guard before the readiness check: a release can arrive after the
-    // post-init voltage sample but before input dispatch is ready, and dropping it
-    // here would leave the guard armed to swallow the next real press.
     const bool was_armed = s_key_guard.armed;
     if (key_guard_consume(&s_key_guard, ev == BSP_BTN_RELEASE, esp_timer_get_time())) {
-        // The release and the deadline both arrive on this task; log the disarm
-        // transition once it happens.
         if (was_armed && !s_key_guard.armed) {
             ESP_LOGI(TAG, "唤醒键已松手,按键恢复响应");
         }
         return;
     }
     if (!s_input_ready || !s_input_queue) return;
-    const input_event_t input = { .btn = btn, .event = ev };
+    const input_event_t input = {.btn = btn, .event = ev};
     (void)xQueueSend(s_input_queue, &input, 0);
 }
 
-void app_main(void) {
-    ESP_LOGI(TAG, "FoloToy AI Passport BSP demo 启动");
-    const uint32_t wake_causes = esp_sleep_get_wakeup_causes();
-    if (wake_causes & ~(1u << ESP_SLEEP_WAKEUP_UNDEFINED)) {
-        ESP_LOGI(TAG, "休眠唤醒原因位图: 0x%02x", (unsigned)wake_causes);
+static void set_detail(mp_err_t err) {
+    snprintf(s_detail, sizeof(s_detail), "%s", meeting_fsm_error_text(err));
+}
+
+static void refresh_ui(void) {
+    if (!bsp_lvgl_lock(30)) return;
+    char timer[16];
+    char last[64];
+    app_hist_t hist[APP_HIST_MAX];
+    int count = 0;
+    int battery = bsp_battery_soc();
+    meeting_fsm_format_timer(timer, sizeof(timer), s_elapsed_ms);
+    switch (s_fsm.screen) {
+    case MP_SCR_PROVISION: {
+        char qr[64];
+        snprintf(qr, sizeof(qr), "WIFI:T:nopass;S:%s;;", portal_ap_ssid());
+        memopass_ui_provision(qr, portal_ap_ssid(), s_fsm.configured);
+        break;
     }
-    // 按键唤醒时,那颗键在整个启动期间还按着。先挡住它的动作(见 on_key)。
+    case MP_SCR_HOME:
+        app_config_hist_load(hist, &count);
+        if (count > 0) {
+            struct tm tm;
+            time_t unix_time = hist[count - 1].unix_time;
+            bool pushed = hist[count - 1].pushed != 0;
+            if (unix_time > 1700000000 && localtime_r(&unix_time, &tm)) {
+                meeting_fsm_format_last(last, sizeof(last), tm.tm_hour, tm.tm_min,
+                                        hist[count - 1].duration_sec, pushed);
+            } else {
+                meeting_fsm_format_last(last, sizeof(last), -1, -1,
+                                        hist[count - 1].duration_sec, pushed);
+            }
+        } else {
+            meeting_fsm_format_last(last, sizeof(last), -1, -1, 0, false);
+        }
+        memopass_ui_home(last, app_net_sta_up(), feishu_url_ok(s_cfg.webhook), battery);
+        break;
+    case MP_SCR_RECORD: {
+        char sub[192];
+        size_t n = 0;
+        uint16_t hold = 0;
+        volc_asr_copy(sub, sizeof(sub), &n);
+        if (s_holding) {
+            int64_t ms = (esp_timer_get_time() - s_hold_start) / 1000;
+            if (ms < 0) ms = 0;
+            if (ms > MP_HOLD_END_MS) ms = MP_HOLD_END_MS;
+            hold = (uint16_t)ms;
+        }
+        memopass_ui_record(&s_fsm, timer, sub, audio_pipeline_level(), s_segments,
+                           !app_net_sta_up() || !volc_asr_up(), hold);
+        break;
+    }
+    case MP_SCR_RESULT:
+        memopass_ui_result(s_fsm.result_ok, s_detail, (int)(s_elapsed_ms / 1000),
+                           s_segments, s_fsm.detail_on);
+        break;
+    case MP_SCR_SETTINGS:
+        memopass_ui_settings(s_fsm.settings_i, s_fsm.beep, s_fsm.factory_armed);
+        break;
+    case MP_SCR_HISTORY:
+        app_config_hist_load(hist, &count);
+        memopass_ui_history(hist, count);
+        break;
+    }
+    bsp_lvgl_unlock();
+}
+
+static void submit_text(const char *text, size_t len, bool final) {
+    feishu_seg_t seg;
+    size_t cut = mp_utf8_fit(text, len, FEISHU_PUSH_TEXT);
+    if (!cut && !final) return;
+    memset(&seg, 0, sizeof(seg));
+    snprintf(seg.meeting_id, sizeof(seg.meeting_id), "%s", s_meeting_id);
+    seg.segment = ++s_segments;
+    seg.is_final = final;
+    seg.duration_sec = (int)(s_elapsed_ms / 1000);
+    seg.text_len = cut;
+    if (cut) memcpy(seg.text, text, cut);
+    if (!feishu_pusher_submit(&seg) && final) set_detail(MP_ERR_FEISHU);
+}
+
+static void session_task(void *arg) {
+    (void)arg;
+    char snap[2200];
+    uint32_t seg_ms = 0;
+    bool mark = false;
+    while (s_session_run) {
+        size_t n = 0;
+        int fail = volc_asr_fail();
+        if (fail == 401) set_detail(MP_ERR_AUTH);
+        else if (fail == 45000030) set_detail(MP_ERR_RESOURCE);
+        else if (fail == 8) set_detail(MP_ERR_NET);
+        if (volc_asr_copy(snap, sizeof(snap), &n) && n) {
+            if (mark) {
+                submit_text("[重点]", strlen("[重点]"), false);
+                mark = false;
+                seg_ms = 0;
+            } else if (meeting_fsm_segment_due(n, seg_ms, s_cfg.segment_min)) {
+                size_t cut = mp_utf8_fit(snap, n, FEISHU_PUSH_TEXT);
+                submit_text(snap, cut, false);
+                volc_asr_drop(cut);
+                seg_ms = 0;
+            }
+        }
+        if (s_fsm.mark_on) mark = true;
+        vTaskDelay(pdMS_TO_TICKS(200));
+        if (!s_paused) {
+            s_elapsed_ms += 200;
+            seg_ms += 200;
+        }
+    }
+    {
+        size_t n = 0;
+        if (volc_asr_copy(snap, sizeof(snap), &n)) submit_text(snap, n, true);
+    }
+    audio_pipeline_stop();
+    volc_asr_close();
+    for (int i = 0; i < 40 && !feishu_pusher_idle() && feishu_pusher_failed() == 0; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    feishu_pusher_stop();
+    {
+        app_hist_t item = {0};
+        item.unix_time = app_net_clock();
+        item.duration_sec = (uint16_t)(s_elapsed_ms / 1000);
+        item.segments = (uint8_t)(s_segments > 255 ? 255 : s_segments);
+        item.pushed = feishu_pusher_failed() == 0 && s_segments > 0;
+        snprintf(item.id, sizeof(item.id), "%s", s_meeting_id);
+        app_config_hist_push(&item);
+        meeting_fsm_push_done(&s_fsm, item.pushed);
+        if (!item.pushed && !s_detail[0]) set_detail(MP_ERR_FEISHU);
+    }
+    vTaskDelete(NULL);
+}
+
+static void start_session(void) {
+    uint32_t rnd = esp_random();
+    snprintf(s_meeting_id, sizeof(s_meeting_id), "%08lx", (unsigned long)rnd);
+    s_segments = 0;
+    s_elapsed_ms = 0;
+    s_paused = false;
+    s_muted = false;
+    s_detail[0] = '\0';
+    if (!s_pcm_used) s_pcm_used = xQueueCreate(3, sizeof(uint8_t *));
+    if (!s_pcm_free) s_pcm_free = xQueueCreate(3, sizeof(uint8_t *));
+    xQueueReset(s_pcm_used);
+    xQueueReset(s_pcm_free);
+    for (int i = 0; i < 3; i++) {
+        uint8_t *slot = s_pcm[i];
+        xQueueSend(s_pcm_free, &slot, 0);
+    }
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    feishu_pusher_start(&s_cfg);
+    volc_asr_open(&s_cfg, s_pcm_used, s_pcm_free);
+    audio_pipeline_start(s_pcm_used, s_pcm_free, &s_paused, &s_muted);
+    s_session_run = true;
+    xTaskCreate(session_task, "mp_session", 6144, NULL, 5, NULL);
+}
+
+static void apply_action(mp_action_t action) {
+    if (action == MP_ACT_START) start_session();
+    else if (action == MP_ACT_PAUSE) s_paused = true;
+    else if (action == MP_ACT_RESUME) s_paused = false;
+    else if (action == MP_ACT_MUTE) s_muted = true;
+    else if (action == MP_ACT_UNMUTE) s_muted = false;
+    else if (action == MP_ACT_STOP) s_session_run = false;
+    else if (action == MP_ACT_PROVISION) {
+        app_net_stop();
+        portal_start(NULL);
+    } else if (action == MP_ACT_LEAVE_PROVISION) {
+        portal_stop();
+        app_net_start_sta(s_cfg.ssid, s_cfg.pass);
+    } else if (action == MP_ACT_TEST_PUSH) {
+        if (feishu_pusher_once(&s_cfg, "会议纪要 MemoPass 测试") == ESP_OK) {
+            snprintf(s_detail, sizeof(s_detail), "测试已发送");
+        } else {
+            set_detail(MP_ERR_FEISHU);
+        }
+        refresh_ui();
+    } else if (action == MP_ACT_FACTORY) {
+        app_config_clear();
+        esp_restart();
+    } else if (action == MP_ACT_RETRY_PUSH) {
+        s_fsm.result_ok = feishu_pusher_once(&s_cfg, s_detail[0] ? s_detail : "会议纪要") == ESP_OK;
+    }
+    if (action == MP_ACT_REDRAW || action == MP_ACT_START || action == MP_ACT_STOP ||
+        action == MP_ACT_PROVISION || action == MP_ACT_LEAVE_PROVISION) {
+        refresh_ui();
+    }
+}
+
+static void input_task(void *arg) {
+    (void)arg;
+    input_event_t input;
+    for (;;) {
+        if (xQueueReceive(s_input_queue, &input, pdMS_TO_TICKS(100)) == pdTRUE) {
+            mp_input_t which = 0;
+            if (input.btn == BSP_BTN_OK && input.event == BSP_BTN_PRESS) {
+                s_holding = true;
+                s_hold_fired = false;
+                s_hold_start = esp_timer_get_time();
+            } else if (input.btn == BSP_BTN_OK && input.event == BSP_BTN_RELEASE) {
+                uint32_t held = (uint32_t)((esp_timer_get_time() - s_hold_start) / 1000);
+                s_holding = false;
+                if (!s_hold_fired) which = meeting_fsm_hold_fires(held) ? MP_IN_OK_HOLD : MP_IN_OK;
+            } else if (input.event == BSP_BTN_CLICK && input.btn == BSP_BTN_UP) {
+                which = MP_IN_UP;
+            } else if (input.event == BSP_BTN_CLICK && input.btn == BSP_BTN_DOWN) {
+                which = MP_IN_DOWN;
+            }
+            if (which) apply_action(meeting_fsm_input(&s_fsm, which));
+        }
+        if (s_holding && !s_hold_fired) {
+            uint32_t held = (uint32_t)((esp_timer_get_time() - s_hold_start) / 1000);
+            if (meeting_fsm_hold_fires(held) && s_fsm.screen == MP_SCR_RECORD) {
+                s_hold_fired = true;
+                s_holding = false;
+                apply_action(meeting_fsm_input(&s_fsm, MP_IN_OK_HOLD));
+            }
+        }
+        if (s_fsm.screen == MP_SCR_RECORD || s_fsm.screen == MP_SCR_RESULT) {
+            apply_action(meeting_fsm_input(&s_fsm, MP_IN_TICK_100MS));
+        }
+        if (s_fsm.screen == MP_SCR_RECORD) refresh_ui();
+    }
+}
+
+void app_main(void) {
+    ESP_LOGI(TAG, "MemoPass 启动");
+    const uint32_t wake_causes = esp_sleep_get_wakeup_causes();
     if (wake_causes & (1u << ESP_SLEEP_WAKEUP_GPIO)) {
         key_guard_arm(&s_key_guard, esp_timer_get_time(), KEY_GUARD_MAX_US);
-        ESP_LOGI(TAG, "按键唤醒:先屏蔽按键动作,直到那颗键松手");
     }
-
+    app_config_load(&s_cfg);
+    s_fsm.beep = s_cfg.beep;
+    meeting_fsm_init(&s_fsm, app_config_ready(&s_cfg));
+    s_fsm.beep = s_cfg.beep;
     bsp_i2c_init();
-    bsp_i2c_scan();
-
-    // 屏幕是本 demo 的 UI 载体,失败就没有菜单可言 —— 打清楚日志后退出,
-    // 不做"串口菜单"降级(那会让本文件复杂一倍,违背参考示例的初衷)。
     if (bsp_display_init() != ESP_OK || !bsp_lvgl_init()) {
-        ESP_LOGE(TAG, "显示/LVGL 初始化失败,demo 无法继续。"
-                      "检查 SPI 接线(MOSI=%d SCLK=%d CS=%d DC=%d BL=%d)",
+        ESP_LOGE(TAG, "显示初始化失败 MOSI=%d SCLK=%d CS=%d DC=%d BL=%d",
                  BSP_LCD_MOSI, BSP_LCD_SCLK, BSP_LCD_CS, BSP_LCD_DC, BSP_LCD_BL);
         return;
     }
-    bsp_display_backlight(100);
-
-    demo_navigation_init(&s_navigation, DEMO_COUNT);
-
-    // 其余外设单项失败不阻塞:菜单里标 [FAIL],其他项照常可测。
-    s_ok[0] = true;                                   // Display 已确认可用
-    esp_err_t input_err = input_dispatch_init();
-    esp_err_t button_err = input_err == ESP_OK
-                         ? bsp_button_init(on_key, NULL)
-                         : ESP_ERR_INVALID_STATE;
-    s_ok[1] = input_err == ESP_OK && button_err == ESP_OK;
-    if (input_err != ESP_OK) {
-        ESP_LOGE(TAG, "按键事件任务创建失败: %s", esp_err_to_name(input_err));
-    } else if (button_err != ESP_OK) {
-        ESP_LOGE(TAG, "按键初始化失败: %s", esp_err_to_name(button_err));
-        input_dispatch_deinit();
-    } else if (s_key_guard.armed) {
-        // 若唤醒键在按键驱动启动前就已松手,组件不会产生 release 事件,守卫会一直
-        // 拦到兜底。初始化完成后按真实电压同步一次:已松手立即撤防。
-        const bool released = bsp_button_read_mv() >= BSP_BTN_MV_RELEASED_MIN;
-        key_guard_sync_released(&s_key_guard, released);
-        if (!s_key_guard.armed) {
-            ESP_LOGI(TAG, "唤醒键在按键驱动启动前已松手,提前撤防");
-        }
+    bsp_display_backlight(70);
+    bsp_battery_init();
+    s_input_queue = xQueueCreate(INPUT_QUEUE_DEPTH, sizeof(input_event_t));
+    xTaskCreate(input_task, "mp_input", 6144, NULL, 5, NULL);
+    if (bsp_button_init(on_key, NULL) == ESP_OK && s_key_guard.armed) {
+        key_guard_sync_released(&s_key_guard, bsp_button_read_mv() >= BSP_BTN_MV_RELEASED_MIN);
     }
-    s_ok[2] = (bsp_audio_init() == ESP_OK);
-    s_ok[3] = (bsp_battery_init() == ESP_OK);
-    s_ok[4] = true;                                    // 页面内按需初始化并显示错误
-    s_ok[5] = true;
-    s_ok[6] = true;
-
     if (bsp_lvgl_lock(1000)) {
-        enter_menu();
+        memopass_ui_init();
         bsp_lvgl_unlock();
-        s_input_ready = true;
     }
-
-    ESP_LOGI(TAG, "就绪:Display=%d Button=%d Audio=%d Battery=%d",
-             s_ok[0], s_ok[1], s_ok[2], s_ok[3]);
+    if (s_fsm.screen == MP_SCR_PROVISION) portal_start(NULL);
+    else app_net_start_sta(s_cfg.ssid, s_cfg.pass);
+    refresh_ui();
+    s_input_ready = true;
 }

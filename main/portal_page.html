@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MemoPass</title>
+<style>
+body{margin:0;background:#0B0F14;color:#F8FAFC;font:16px/1.45 sans-serif}
+main{max-width:520px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:0 0 12px}
+section{background:#161D26;border:1px solid #263241;border-radius:10px;padding:12px;margin:0 0 12px}
+label{display:block;color:#94A3B8;font-size:13px;margin:8px 0 4px}
+input,select,button{width:100%;box-sizing:border-box;border-radius:8px;border:1px solid #263241;background:#0B0F14;color:#F8FAFC;padding:10px;font-size:16px}
+button{background:#3370FF;border:0;margin-top:8px}
+button.ghost{background:transparent;border:1px solid #3370FF}
+small{display:block;color:#64748B;margin-top:6px}
+.ok{color:#12B76A}.bad{color:#F79009}
+</style>
+</head>
+<body>
+<main>
+<h1>MemoPass 配网</h1>
+<section>
+<label>1. 连接 Wi-Fi</label>
+<input id="ssid" placeholder="输入 Wi-Fi 名称，或从下面选择">
+<select id="nets" onchange="if(this.value)q('ssid').value=this.value"></select>
+<button class="ghost" type="button" onclick="scan()">刷新附近网络</button>
+<p id="scanmsg">正在搜索附近网络</p>
+<label>密码</label>
+<input id="pass" type="password" autocomplete="off">
+</section>
+<section>
+<label>2. 火山引擎语音服务</label>
+<label>APP ID</label>
+<input id="app_id" autocomplete="off">
+<label>Access Token</label>
+<input id="access" type="password" autocomplete="off" placeholder="已保存时留空则保持原值">
+<small>需确保同一应用下已开通“流式语音识别大模型”服务</small>
+</section>
+<section>
+<label>3. 飞书接收地址</label>
+<input id="webhook" placeholder="粘贴飞书 Webhook URL">
+<button class="ghost" type="button" onclick="testHook()">发送测试消息</button>
+<p id="testmsg"></p>
+<details>
+<summary>3 步获取飞书地址 &amp; 一键复制 AI 纪要提示词</summary>
+<ol>
+<li>群机器人：群设置 → 群机器人 → 自定义机器人，关键词填 会议纪要，复制 Webhook。</li>
+<li>或多维表格：建列 会议编号、分段、原始转写、AI 纪要，自动化选“接收到 Webhook 时”并新增记录。</li>
+<li>把地址粘贴到上面。设备看到 bot/v2/hook 走群机器人，否则走多维表格。</li>
+</ol>
+<button class="ghost" type="button" onclick="copyPrompt()">复制 AI 纪要提示词</button>
+</details>
+</section>
+<details>
+<summary>高级设置</summary>
+<section>
+<label>鉴权</label>
+<select id="auth"><option value="app">APP ID + Access Token</option><option value="apikey">单 X-Api-Key</option></select>
+<label>API Key</label>
+<input id="apikey" type="password" autocomplete="off">
+<label>Resource ID</label>
+<input id="resource" value="volc.bigasr.sauc.duration">
+<label>飞书签名 Secret</label>
+<input id="secret" type="password" autocomplete="off">
+<label>自动分段</label>
+<select id="segment"><option value="1">1 分钟</option><option value="3" selected>3 分钟</option><option value="5">5 分钟</option></select>
+</section>
+</details>
+<button type="button" onclick="save()">保存并联网</button>
+<p id="msg"></p>
+</main>
+<script>
+function q(id){return document.getElementById(id)}
+function enc(s){return encodeURIComponent(s||"")}
+function body(){
+  return "ssid="+enc(q("ssid").value)+"&pass="+enc(q("pass").value)
+    +"&app_id="+enc(q("app_id").value)+"&access="+enc(q("access").value)
+    +"&apikey="+enc(q("apikey").value)+"&webhook="+enc(q("webhook").value)
+    +"&secret="+enc(q("secret").value)+"&resource="+enc(q("resource").value)
+    +"&segment="+enc(q("segment").value)+"&auth="+enc(q("auth").value);
+}
+function scan(){
+  q("scanmsg").textContent="正在读取附近网络";
+  var done=function(r){return r.json()};
+  var show=function(j){
+    var s=q("nets"); s.innerHTML="";
+    var nets=j.nets||[];
+    nets.forEach(function(n){
+      var o=document.createElement("option");
+      o.value=n.ssid; o.textContent=n.ssid+"  "+n.rssi+"dBm";
+      s.appendChild(o);
+    });
+    if(!q("ssid").value && nets.length) q("ssid").value=nets[0].ssid;
+    q("scanmsg").textContent=nets.length?("找到 "+nets.length+" 个网络"):"还没搜到，可直接输入名称，或过几秒再点";
+  };
+  var fail=function(){q("scanmsg").textContent="刷新失败，可直接输入 Wi-Fi 名称"};
+  fetch("http://192.168.4.1/scan").then(done).then(show).catch(function(){
+    fetch("/scan").then(done).then(show).catch(fail);
+  });
+}
+function save(){
+  var post=function(url){
+    return fetch(url,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body()});
+  };
+  post("http://192.168.4.1/save").then(r=>r.json()).then(j=>{
+    q("msg").className=j.ok?"ok":"bad";
+    q("msg").textContent=j.message|| (j.ok?"已保存，设备正在联网":"请检查必填项");
+  }).catch(function(){
+    post("/save").then(r=>r.json()).then(j=>{
+      q("msg").className=j.ok?"ok":"bad";
+      q("msg").textContent=j.message|| (j.ok?"已保存，设备正在联网":"请检查必填项");
+    }).catch(function(){q("msg").textContent="保存失败，请重试"});
+  });
+}
+function testHook(){
+  q("testmsg").textContent="正在发送测试消息";
+  fetch("/test",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body()})
+    .then(r=>r.json()).then(j=>{ q("testmsg").textContent=j.message||""; })
+    .catch(function(){q("testmsg").textContent="测试失败，请检查地址"});
+}
+function copyPrompt(){
+  var t="根据“原始转写”提炼：1.核心结论 2.待办与负责人 3.标有[重点]的内容";
+  if(navigator.clipboard) navigator.clipboard.writeText(t);
+  q("testmsg").textContent="提示词已复制";
+}
+scan();
+</script>
+</body>
+</html>

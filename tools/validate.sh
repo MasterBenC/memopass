@@ -75,6 +75,12 @@ run_static_checks() {
             -o "${test_dir}/test_demo_${demo}_runtime"
         "${test_dir}/test_demo_${demo}_runtime"
     done
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_memopass.c main/meeting_fsm.c main/feishu_formatter.c \
+        main/app_config.c main/portal_server.c main/volc_asr_proto.c \
+        main/volc_asr_json.c main/mp_utf8.c \
+        -o "${test_dir}/test_memopass"
+    "${test_dir}/test_memopass"
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_battery_profile.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_deep_sleep_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_key_wake_contract.py

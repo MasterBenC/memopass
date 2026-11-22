@@ -1,4 +1,5 @@
 build/
+build-gate/
 sdkconfig
 sdkconfig.old
 managed_components/
