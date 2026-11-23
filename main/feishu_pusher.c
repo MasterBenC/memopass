@@ -43,6 +43,9 @@ static volatile bool s_run;
 static volatile int s_sent;
 static volatile int s_failed;
 static char s_body[4096];
+/* Short Feishu JSON only (code/msg). Never log this buffer. */
+static char s_resp[256];
+static size_t s_resp_len;
 
 static void log_heap(const char *when) {
     ESP_LOGI(TAG, "heap %s: free=%u min=%u largest=%u", when,
@@ -98,13 +101,38 @@ static uint32_t wait_clock(uint32_t max_ms) {
     return now;
 }
 
+static esp_err_t on_http_event(esp_http_client_event_t *evt) {
+    if (!evt || evt->event_id != HTTP_EVENT_ON_DATA || !evt->data || evt->data_len <= 0) {
+        return ESP_OK;
+    }
+    size_t room = sizeof(s_resp) - 1 - s_resp_len;
+    size_t n = (size_t)evt->data_len < room ? (size_t)evt->data_len : room;
+    if (n) {
+        memcpy(s_resp + s_resp_len, evt->data, n);
+        s_resp_len += n;
+        s_resp[s_resp_len] = '\0';
+    }
+    return ESP_OK;
+}
+
+static bool push_http_ok(esp_err_t err, int status, int *biz_code) {
+    int code = 0;
+    bool got = feishu_parse_response_code(s_resp, s_resp_len, &code);
+    if (biz_code) *biz_code = got ? code : 0;
+    if (err != ESP_OK || status < 200 || status >= 300) return false;
+    return !got || code == 0;
+}
+
 static esp_err_t post_body(const char *url, const char *body, int *status) {
     esp_http_client_config_t cfg = {
         .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 8000,
         .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler = on_http_event,
     };
+    s_resp_len = 0;
+    s_resp[0] = '\0';
     wait_tls_room();
     log_heap("before https");
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -162,24 +190,28 @@ static void push_task(void *arg) {
         if (format_seg(seg, s_body, sizeof(s_body), PUSH_CLOCK_WAIT_MS)) {
             for (int attempt = 0; attempt < 3 && !ok; attempt++) {
                 int status = 0;
+                int biz = 0;
                 esp_err_t err = post_body(s_cfg->webhook, s_body, &status);
-                ok = err == ESP_OK && status >= 200 && status < 300;
+                ok = push_http_ok(err, status, &biz);
                 if (!ok && attempt < 2) {
                     /* Longer back-off after an allocation failure so the WSS
                      * session can release its buffers before we retry. */
                     uint32_t delay = err == ESP_ERR_NO_MEM || !heap_ok()
                                          ? 1500u * (uint32_t)(attempt + 1)
                                          : 400u * (uint32_t)(attempt + 1);
-                    ESP_LOGW(TAG, "push seg=%d attempt=%d status=%d, retry in %u ms",
-                             seg->segment, attempt + 1, status, (unsigned)delay);
+                    ESP_LOGW(TAG, "push seg=%d attempt=%d status=%d feishu_code=%d, retry in %u ms",
+                             seg->segment, attempt + 1, status, biz, (unsigned)delay);
                     vTaskDelay(pdMS_TO_TICKS(delay));
+                } else if (!ok) {
+                    ESP_LOGW(TAG, "push failed seg=%d status=%d feishu_code=%d err=%s",
+                             seg->segment, status, biz, esp_err_to_name(err));
                 }
             }
         }
         if (ok) s_sent++;
         else {
             s_failed++;
-            ESP_LOGW(TAG, "push failed seg=%d", seg->segment);
+            if (s_run) ESP_LOGW(TAG, "push failed seg=%d", seg->segment);
         }
         xQueueSend(s_free, &seg, 0);
     }
@@ -252,7 +284,12 @@ esp_err_t feishu_pusher_once(const app_config_t *cfg, const char *text) {
     memcpy(seg.text, text, seg.text_len);
     if (!format_seg(&seg, s_body, sizeof(s_body), PUSH_CLOCK_WAIT_ONCE_MS)) return ESP_FAIL;
     int status = 0;
+    int biz = 0;
     esp_err_t err = post_body(cfg->webhook, s_body, &status);
-    if (err != ESP_OK || status < 200 || status >= 300) return ESP_FAIL;
+    if (!push_http_ok(err, status, &biz)) {
+        ESP_LOGW(TAG, "test/once push failed status=%d feishu_code=%d err=%s",
+                 status, biz, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }

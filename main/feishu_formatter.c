@@ -354,3 +354,47 @@ int feishu_format(feishu_kind_t kind, const feishu_job_t *job, char *out, size_t
     if (append(out, cap, &used, "\"}") != 0) return -1;
     return (int)used;
 }
+
+bool feishu_parse_response_code(const char *body, size_t len, int *code) {
+    if (!body || !code) return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char prev;
+        size_t j;
+        int sign = 1;
+        long value = 0;
+        int digits = 0;
+        if (body[i] != '"') continue;
+        if (i + 6 > len) break;
+        if (memcmp(body + i, "\"code\"", 6) != 0) continue;
+        prev = i > 0 ? (unsigned char)body[i - 1] : 0;
+        if ((prev >= 'A' && prev <= 'Z') || (prev >= 'a' && prev <= 'z') ||
+            (prev >= '0' && prev <= '9') || prev == '_' || prev == '-') {
+            continue;
+        }
+        j = i + 6;
+        while (j < len && (body[j] == ' ' || body[j] == '\t' || body[j] == '\n' ||
+                           body[j] == '\r')) {
+            j++;
+        }
+        if (j >= len || body[j] != ':') continue;
+        j++;
+        while (j < len && (body[j] == ' ' || body[j] == '\t' || body[j] == '\n' ||
+                           body[j] == '\r')) {
+            j++;
+        }
+        if (j < len && body[j] == '-') {
+            sign = -1;
+            j++;
+        }
+        while (j < len && body[j] >= '0' && body[j] <= '9') {
+            value = value * 10 + (body[j] - '0');
+            if (value > 2000000000L) return false;
+            digits++;
+            j++;
+        }
+        if (!digits) continue;
+        *code = (int)(sign * value);
+        return true;
+    }
+    return false;
+}

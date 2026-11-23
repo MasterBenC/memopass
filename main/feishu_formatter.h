@@ -38,3 +38,8 @@ int feishu_sign(uint32_t unix_time, const char *secret, char *out, size_t cap);
 /* Writes one JSON body. Bot text always contains 会议纪要 and stays under 20 KB.
  * Returns the byte length, or -1 if the buffer is too small or the job is invalid. */
 int feishu_format(feishu_kind_t kind, const feishu_job_t *job, char *out, size_t cap);
+
+/* If body contains a JSON integer key "code", write it to *code and return true.
+ * Ignores longer keys such as StatusCode. Missing or unparsable code returns false. */
+bool feishu_parse_response_code(const char *body, size_t len, int *code);
+

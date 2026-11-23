@@ -34,13 +34,21 @@ static void test_fsm(void) {
     assert(!st.mark_on);
     assert(meeting_fsm_input(&st, MP_IN_OK_HOLD) == MP_ACT_STOP);
     assert(st.screen == MP_SCR_RESULT);
+    assert(st.result_pending);
+    assert(strcmp(meeting_fsm_key_guide(&st), "正在同步") == 0);
+    assert(meeting_fsm_input(&st, MP_IN_OK) == MP_ACT_NONE);
+    assert(meeting_fsm_input(&st, MP_IN_UP) == MP_ACT_NONE);
+    assert(meeting_fsm_input(&st, MP_IN_DOWN) == MP_ACT_NONE);
+    for (int i = 0; i < 40; i++) assert(meeting_fsm_input(&st, MP_IN_TICK_100MS) == MP_ACT_NONE);
+    assert(st.screen == MP_SCR_RESULT && st.result_pending);
     meeting_fsm_push_done(&st, true);
-    assert(st.result_ok);
+    assert(st.result_ok && !st.result_pending);
     assert(strcmp(meeting_fsm_key_guide(&st), "确认:回主页") == 0);
     for (int i = 0; i < 29; i++) assert(meeting_fsm_input(&st, MP_IN_TICK_100MS) == MP_ACT_NONE);
     assert(meeting_fsm_input(&st, MP_IN_TICK_100MS) == MP_ACT_REDRAW);
     assert(st.screen == MP_SCR_HOME);
     meeting_fsm_push_done(&st, false);
+    assert(!st.result_ok && !st.result_pending);
     assert(meeting_fsm_input(&st, MP_IN_DOWN) == MP_ACT_REDRAW);
     assert(st.detail_on);
     assert(meeting_fsm_input(&st, MP_IN_OK) == MP_ACT_RETRY_PUSH);
@@ -62,6 +70,8 @@ static void test_fsm(void) {
     assert(meeting_fsm_segment_due(10, 60000, 1));
     assert(!meeting_fsm_segment_due(10, 60000, 3));
     assert(meeting_fsm_segment_due(10, 180000, 3));
+    meeting_fsm_return_home(&st);
+    assert(st.screen == MP_SCR_HOME && !st.result_pending && !st.recording);
 }
 
 static void test_text(void) {
@@ -74,6 +84,7 @@ static void test_text(void) {
                   "火山引擎凭证无效，请核对 APP ID 与 Token") == 0);
     assert(strstr(meeting_fsm_error_text(MP_ERR_FEISHU), "飞书") != NULL);
     assert(strstr(meeting_fsm_error_text(MP_ERR_NET), "HTTP") == NULL);
+    assert(strstr(meeting_fsm_error_text(MP_ERR_EMPTY), "没有识别到内容") != NULL);
     assert(mp_utf8_fit("中文A", 7, 4) == 3);
     assert(mp_utf8_valid("中文", 6));
     assert(!mp_utf8_valid("中文", 5));
@@ -110,6 +121,22 @@ static void test_feishu(void) {
     assert(strstr(body, "\"is_final\":true") != NULL);
     assert(strstr(body, "\"text\":\"结论\"") != NULL);
     assert(feishu_utf8_cut("甲乙丙", 9, 4) == 3);
+}
+
+static void test_feishu_response_code(void) {
+    int code = -1;
+    const char *ok_body = "{\"code\":0,\"msg\":\"success\"}";
+    const char *sign_body = "{\"StatusCode\":0,\"code\":19021}";
+    const char *spaced = "{\n  \"code\" : 19022 }";
+    const char *no_code = "{\"msg\":\"ok\"}";
+    const char *neg = "{\"code\":-1}";
+    assert(feishu_parse_response_code(ok_body, strlen(ok_body), &code) && code == 0);
+    assert(feishu_parse_response_code(sign_body, strlen(sign_body), &code) && code == 19021);
+    assert(feishu_parse_response_code(spaced, strlen(spaced), &code) && code == 19022);
+    assert(!feishu_parse_response_code(no_code, strlen(no_code), &code));
+    assert(!feishu_parse_response_code("", 0, &code));
+    assert(!feishu_parse_response_code(NULL, 0, &code));
+    assert(feishu_parse_response_code(neg, strlen(neg), &code) && code == -1);
 }
 
 /* Decodes the JSON string that starts right after `key` in body (the opening
@@ -371,6 +398,7 @@ int main(void) {
     test_fsm();
     test_text();
     test_feishu();
+    test_feishu_response_code();
     test_feishu_escape_boundary();
     test_portal_and_config();
     test_portal_merge_keeps_secrets();
