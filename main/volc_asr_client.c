@@ -13,10 +13,18 @@
 #include "freertos/task.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "memopass_asr";
 static const char *ASR_URI = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async";
+
+#define ASR_RX_CAP 3072
+/* Polling step for every wait inside asr_task, so s_run == false is noticed
+ * within ~20 ms instead of up to 200 ms (connect) or 1500 ms (backoff). */
+#define ASR_POLL_MS 20
+#define ASR_CONNECT_TIMEOUT_MS 8000
+#define ASR_RETRY_DELAY_MS 1500
 
 static char s_headers[512];
 static esp_websocket_client_handle_t s_ws;
@@ -24,13 +32,17 @@ static QueueHandle_t s_used;
 static QueueHandle_t s_free;
 static TaskHandle_t s_task;
 static SemaphoreHandle_t s_mu;
+/* Given by asr_task after it has released s_ws and s_rx; volc_asr_close waits on it. */
+static SemaphoreHandle_t s_done;
+static volatile bool s_alive;
 static volatile bool s_run;
 static volatile int s_failed;
 static volatile bool s_up;
+static volatile bool s_connecting;
 static char s_text[2048];
 static size_t s_text_len;
 static int32_t s_seq;
-static uint8_t s_rx[3072];
+static uint8_t *s_rx;
 static size_t s_rx_len;
 static const app_config_t *s_cfg;
 
@@ -66,8 +78,9 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (id != WEBSOCKET_EVENT_DATA || !data) return;
     esp_websocket_event_data_t *event = data;
     if (event->op_code != 0x2 || event->data_len <= 0) return;
+    if (!s_rx) return;
     if (event->payload_offset == 0) s_rx_len = 0;
-    if (s_rx_len + (size_t)event->data_len > sizeof(s_rx)) {
+    if (s_rx_len + (size_t)event->data_len > ASR_RX_CAP) {
         s_failed = 8;
         return;
     }
@@ -99,7 +112,34 @@ static bool send_frame(uint8_t type, uint8_t flags, uint8_t ser, int32_t seq,
                                          pdMS_TO_TICKS(2000)) > 0;
 }
 
+/* Stops and destroys the current client, if any. Safe to call repeatedly. */
+static void ws_teardown(void) {
+    if (!s_ws) return;
+    esp_websocket_client_stop(s_ws);
+    esp_websocket_client_destroy(s_ws);
+    s_ws = NULL;
+    s_up = false;
+}
+
+/* Sleeps up to ms, waking early once s_run turns false. */
+static void sleep_while_running(uint32_t ms) {
+    for (uint32_t t = 0; t < ms && s_run; t += ASR_POLL_MS) {
+        vTaskDelay(pdMS_TO_TICKS(ASR_POLL_MS));
+    }
+}
+
+static bool connect_once_inner(void);
+
+/* s_connecting brackets the TLS handshake so feishu_pusher can avoid running a
+ * second handshake at the same time (the peak-heap moment on ESP32-C3). */
 static bool connect_once(void) {
+    s_connecting = true;
+    bool ok = connect_once_inner();
+    s_connecting = false;
+    return ok;
+}
+
+static bool connect_once_inner(void) {
     char id[33];
     uint8_t rnd[16];
     esp_fill_random(rnd, sizeof(rnd));
@@ -117,25 +157,42 @@ static bool connect_once(void) {
         .crt_bundle_attach = esp_crt_bundle_attach,
         .disable_auto_reconnect = true,
     };
+    s_up = false;
+    s_rx_len = 0;
     s_ws = esp_websocket_client_init(&cfg);
     if (!s_ws) return false;
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event, NULL);
-    if (esp_websocket_client_start(s_ws) != ESP_OK) return false;
-    for (int i = 0; i < 40 && s_run && !s_up && !s_failed; i++) {
-        vTaskDelay(pdMS_TO_TICKS(200));
+    if (esp_websocket_client_start(s_ws) != ESP_OK) {
+        ESP_LOGW(TAG, "ws start failed");
+        ws_teardown();
+        return false;
     }
-    return s_up;
+    for (uint32_t t = 0; t < ASR_CONNECT_TIMEOUT_MS && s_run && !s_up && !s_failed;
+         t += ASR_POLL_MS) {
+        vTaskDelay(pdMS_TO_TICKS(ASR_POLL_MS));
+    }
+    if (s_up && s_run && !s_failed) return true;
+    /* Timeout, handshake error or close request: never leak the client. */
+    if (s_run) ESP_LOGW(TAG, "connect failed fail=%d up=%d", s_failed, s_up);
+    ws_teardown();
+    return false;
 }
 
 static void asr_task(void *arg) {
     (void)arg;
     const char *request = volc_asr_request_json();
+    s_rx_len = 0;
+    s_rx = malloc(ASR_RX_CAP);
+    if (!s_rx) {
+        ESP_LOGE(TAG, "no memory for rx buffer");
+        s_failed = 8;
+    }
     while (s_run && !s_failed) {
         if (!connect_once()) {
             if (s_failed == 401 || s_failed == 45000030) break;
             s_failed = 0;
             if (!s_run) break;
-            vTaskDelay(pdMS_TO_TICKS(1500));
+            sleep_while_running(ASR_RETRY_DELAY_MS);
             continue;
         }
         s_seq = 1;
@@ -146,7 +203,7 @@ static void asr_task(void *arg) {
         }
         while (s_run && !s_failed && s_up) {
             uint8_t *slot = NULL;
-            if (xQueueReceive(s_used, &slot, pdMS_TO_TICKS(200)) != pdTRUE) continue;
+            if (xQueueReceive(s_used, &slot, pdMS_TO_TICKS(ASR_POLL_MS * 2)) != pdTRUE) continue;
             s_seq++;
             if (!send_frame(VOLC_MSG_AUDIO_CLIENT, VOLC_FLAG_SEQUENCE, VOLC_SER_RAW,
                             s_seq, slot, AUDIO_PCM_BYTES)) {
@@ -159,32 +216,30 @@ static void asr_task(void *arg) {
             send_frame(VOLC_MSG_AUDIO_CLIENT, VOLC_FLAG_SEQUENCE | VOLC_FLAG_LAST,
                        VOLC_SER_RAW, -s_seq, NULL, 0);
         }
-        if (s_ws) {
-            esp_websocket_client_stop(s_ws);
-            esp_websocket_client_destroy(s_ws);
-            s_ws = NULL;
-        }
-        s_up = false;
+        ws_teardown();
         if (s_run && s_failed == 8) {
             s_failed = 0;
-            vTaskDelay(pdMS_TO_TICKS(1500));
+            sleep_while_running(ASR_RETRY_DELAY_MS);
             continue;
         }
         break;
     }
-    if (s_ws) {
-        esp_websocket_client_stop(s_ws);
-        esp_websocket_client_destroy(s_ws);
-        s_ws = NULL;
-    }
+    ws_teardown();
+    free(s_rx);
+    s_rx = NULL;
+    s_rx_len = 0;
     s_task = NULL;
+    s_alive = false;
+    xSemaphoreGive(s_done);
     vTaskDelete(NULL);
 }
 
 esp_err_t volc_asr_open(const app_config_t *cfg, QueueHandle_t used, QueueHandle_t freeq) {
-    if (!cfg || s_task) return ESP_ERR_INVALID_STATE;
+    if (!cfg || s_task || s_alive) return ESP_ERR_INVALID_STATE;
     if (!s_mu) s_mu = xSemaphoreCreateMutex();
-    if (!s_mu) return ESP_ERR_NO_MEM;
+    if (!s_done) s_done = xSemaphoreCreateBinary();
+    if (!s_mu || !s_done) return ESP_ERR_NO_MEM;
+    (void)xSemaphoreTake(s_done, 0);
     s_cfg = cfg;
     s_used = used;
     s_free = freeq;
@@ -193,8 +248,11 @@ esp_err_t volc_asr_open(const app_config_t *cfg, QueueHandle_t used, QueueHandle
     s_failed = 0;
     s_up = false;
     s_run = true;
+    s_alive = true;
     if (xTaskCreate(asr_task, "mp_asr", 5120, NULL, 5, &s_task) != pdPASS) {
         s_run = false;
+        s_alive = false;
+        s_task = NULL;
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -202,7 +260,20 @@ esp_err_t volc_asr_open(const app_config_t *cfg, QueueHandle_t used, QueueHandle
 
 void volc_asr_close(void) {
     s_run = false;
-    for (int i = 0; i < 80 && s_task; i++) vTaskDelay(pdMS_TO_TICKS(25));
+    if (!s_done) return;
+    if (!s_alive) {
+        /* Task already finished on its own (e.g. auth failure): drain its signal. */
+        (void)xSemaphoreTake(s_done, 0);
+        return;
+    }
+    /* Wait until asr_task has stopped/destroyed the client and freed s_rx, so a
+     * following volc_asr_open never overlaps the old connection. A TLS stop can
+     * block for a few seconds on a dead link; keep waiting but log it. */
+    int waited_s = 0;
+    while (xSemaphoreTake(s_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        waited_s++;
+        ESP_LOGW(TAG, "waiting for asr task to exit (%d s)", waited_s);
+    }
 }
 
 bool volc_asr_copy(char *out, size_t cap, size_t *len) {
@@ -230,3 +301,4 @@ void volc_asr_drop(size_t n) {
 
 int volc_asr_fail(void) { return s_failed; }
 bool volc_asr_up(void) { return s_up; }
+bool volc_asr_connecting(void) { return s_connecting; }

@@ -13,3 +13,5 @@ bool volc_asr_copy(char *out, size_t cap, size_t *len);
 void volc_asr_drop(size_t n);
 int volc_asr_fail(void);
 bool volc_asr_up(void);
+/* True while a WSS/TLS handshake is in progress. */
+bool volc_asr_connecting(void);
