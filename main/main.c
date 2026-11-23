@@ -24,6 +24,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lvgl.h"
 
@@ -58,6 +59,21 @@ static char s_meeting_id[12];
 static uint8_t s_pcm[3][AUDIO_PCM_BYTES];
 static QueueHandle_t s_pcm_used;
 static QueueHandle_t s_pcm_free;
+/* Guards state shared by input_task, session_task and refresh_ui: s_fsm,
+ * s_cfg, s_paused, s_muted, s_detail, s_segments, s_elapsed_ms, s_meeting_id
+ * and the hold timer. Recursive so apply_action helpers may nest. Never hold
+ * it across blocking work (network, LVGL lock, task waits). */
+static SemaphoreHandle_t s_state_mu;
+/* Set when a redraw could not take the LVGL lock; input_task redraws later. */
+static volatile bool s_ui_dirty;
+
+static void state_lock(void) {
+    if (s_state_mu) xSemaphoreTakeRecursive(s_state_mu, portMAX_DELAY);
+}
+
+static void state_unlock(void) {
+    if (s_state_mu) xSemaphoreGiveRecursive(s_state_mu);
+}
 
 static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
     (void)user;
@@ -74,22 +90,51 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
 }
 
 static void set_detail(mp_err_t err) {
+    state_lock();
     snprintf(s_detail, sizeof(s_detail), "%s", meeting_fsm_error_text(err));
+    state_unlock();
+}
+
+static void set_detail_text(const char *text) {
+    state_lock();
+    snprintf(s_detail, sizeof(s_detail), "%s", text);
+    state_unlock();
 }
 
 static void refresh_ui(void) {
-    if (!bsp_lvgl_lock(30)) return;
+    if (!bsp_lvgl_lock(30)) {
+        /* Do not drop a state change silently: input_task redraws next loop. */
+        s_ui_dirty = true;
+        return;
+    }
+    s_ui_dirty = false;
+    meeting_fsm_t fsm;
+    char detail[sizeof(s_detail)];
+    char webhook[sizeof(s_cfg.webhook)];
+    uint32_t elapsed_ms;
+    int segments;
+    bool holding;
+    int64_t hold_start;
+    state_lock();
+    fsm = s_fsm;
+    memcpy(detail, s_detail, sizeof(detail));
+    memcpy(webhook, s_cfg.webhook, sizeof(webhook));
+    elapsed_ms = s_elapsed_ms;
+    segments = s_segments;
+    holding = s_holding;
+    hold_start = s_hold_start;
+    state_unlock();
     char timer[16];
     char last[64];
     app_hist_t hist[APP_HIST_MAX];
     int count = 0;
     int battery = bsp_battery_soc();
-    meeting_fsm_format_timer(timer, sizeof(timer), s_elapsed_ms);
-    switch (s_fsm.screen) {
+    meeting_fsm_format_timer(timer, sizeof(timer), elapsed_ms);
+    switch (fsm.screen) {
     case MP_SCR_PROVISION: {
         char qr[64];
         snprintf(qr, sizeof(qr), "WIFI:T:nopass;S:%s;;", portal_ap_ssid());
-        memopass_ui_provision(qr, portal_ap_ssid(), s_fsm.configured);
+        memopass_ui_provision(qr, portal_ap_ssid(), fsm.configured);
         break;
     }
     case MP_SCR_HOME:
@@ -108,29 +153,29 @@ static void refresh_ui(void) {
         } else {
             meeting_fsm_format_last(last, sizeof(last), -1, -1, 0, false);
         }
-        memopass_ui_home(last, app_net_sta_up(), feishu_url_ok(s_cfg.webhook), battery);
+        memopass_ui_home(last, app_net_sta_up(), feishu_url_ok(webhook), battery);
         break;
     case MP_SCR_RECORD: {
         char sub[192];
         size_t n = 0;
         uint16_t hold = 0;
         volc_asr_copy(sub, sizeof(sub), &n);
-        if (s_holding) {
-            int64_t ms = (esp_timer_get_time() - s_hold_start) / 1000;
+        if (holding) {
+            int64_t ms = (esp_timer_get_time() - hold_start) / 1000;
             if (ms < 0) ms = 0;
             if (ms > MP_HOLD_END_MS) ms = MP_HOLD_END_MS;
             hold = (uint16_t)ms;
         }
-        memopass_ui_record(&s_fsm, timer, sub, audio_pipeline_level(), s_segments,
+        memopass_ui_record(&fsm, timer, sub, audio_pipeline_level(), segments,
                            !app_net_sta_up() || !volc_asr_up(), hold);
         break;
     }
     case MP_SCR_RESULT:
-        memopass_ui_result(s_fsm.result_ok, s_detail, (int)(s_elapsed_ms / 1000),
-                           s_segments, s_fsm.detail_on);
+        memopass_ui_result(fsm.result_ok, detail, (int)(elapsed_ms / 1000),
+                           segments, fsm.detail_on);
         break;
     case MP_SCR_SETTINGS:
-        memopass_ui_settings(s_fsm.settings_i, s_fsm.beep, s_fsm.factory_armed);
+        memopass_ui_settings(fsm.settings_i, fsm.beep, fsm.factory_armed);
         break;
     case MP_SCR_HISTORY:
         app_config_hist_load(hist, &count);
@@ -145,10 +190,12 @@ static void submit_text(const char *text, size_t len, bool final) {
     size_t cut = mp_utf8_fit(text, len, FEISHU_PUSH_TEXT);
     if (!cut && !final) return;
     memset(&seg, 0, sizeof(seg));
+    state_lock();
     snprintf(seg.meeting_id, sizeof(seg.meeting_id), "%s", s_meeting_id);
     seg.segment = ++s_segments;
-    seg.is_final = final;
     seg.duration_sec = (int)(s_elapsed_ms / 1000);
+    state_unlock();
+    seg.is_final = final;
     seg.text_len = cut;
     if (cut) memcpy(seg.text, text, cut);
     if (!feishu_pusher_submit(&seg) && final) set_detail(MP_ERR_FEISHU);
@@ -159,6 +206,9 @@ static void session_task(void *arg) {
     char snap[2200];
     uint32_t seg_ms = 0;
     bool mark = false;
+    state_lock();
+    const int segment_min = s_cfg.segment_min;
+    state_unlock();
     while (s_session_run) {
         size_t n = 0;
         int fail = volc_asr_fail();
@@ -170,19 +220,23 @@ static void session_task(void *arg) {
                 submit_text("[重点]", strlen("[重点]"), false);
                 mark = false;
                 seg_ms = 0;
-            } else if (meeting_fsm_segment_due(n, seg_ms, s_cfg.segment_min)) {
+            } else if (meeting_fsm_segment_due(n, seg_ms, segment_min)) {
                 size_t cut = mp_utf8_fit(snap, n, FEISHU_PUSH_TEXT);
                 submit_text(snap, cut, false);
                 volc_asr_drop(cut);
                 seg_ms = 0;
             }
         }
+        state_lock();
         if (s_fsm.mark_on) mark = true;
+        state_unlock();
         vTaskDelay(pdMS_TO_TICKS(200));
+        state_lock();
         if (!s_paused) {
             s_elapsed_ms += 200;
             seg_ms += 200;
         }
+        state_unlock();
     }
     {
         size_t n = 0;
@@ -197,25 +251,33 @@ static void session_task(void *arg) {
     {
         app_hist_t item = {0};
         item.unix_time = app_net_clock();
+        state_lock();
         item.duration_sec = (uint16_t)(s_elapsed_ms / 1000);
         item.segments = (uint8_t)(s_segments > 255 ? 255 : s_segments);
         item.pushed = feishu_pusher_failed() == 0 && s_segments > 0;
         snprintf(item.id, sizeof(item.id), "%s", s_meeting_id);
+        state_unlock();
         app_config_hist_push(&item);
+        state_lock();
         meeting_fsm_push_done(&s_fsm, item.pushed);
         if (!item.pushed && !s_detail[0]) set_detail(MP_ERR_FEISHU);
+        state_unlock();
+        /* The result screen must show the final push state. */
+        s_ui_dirty = true;
     }
     vTaskDelete(NULL);
 }
 
 static void start_session(void) {
     uint32_t rnd = esp_random();
+    state_lock();
     snprintf(s_meeting_id, sizeof(s_meeting_id), "%08lx", (unsigned long)rnd);
     s_segments = 0;
     s_elapsed_ms = 0;
     s_paused = false;
     s_muted = false;
     s_detail[0] = '\0';
+    state_unlock();
     if (!s_pcm_used) s_pcm_used = xQueueCreate(3, sizeof(uint8_t *));
     if (!s_pcm_free) s_pcm_free = xQueueCreate(3, sizeof(uint8_t *));
     xQueueReset(s_pcm_used);
@@ -232,12 +294,18 @@ static void start_session(void) {
     xTaskCreate(session_task, "mp_session", 6144, NULL, 5, NULL);
 }
 
+static void set_flag(volatile bool *flag, bool value) {
+    state_lock();
+    *flag = value;
+    state_unlock();
+}
+
 static void apply_action(mp_action_t action) {
     if (action == MP_ACT_START) start_session();
-    else if (action == MP_ACT_PAUSE) s_paused = true;
-    else if (action == MP_ACT_RESUME) s_paused = false;
-    else if (action == MP_ACT_MUTE) s_muted = true;
-    else if (action == MP_ACT_UNMUTE) s_muted = false;
+    else if (action == MP_ACT_PAUSE) set_flag(&s_paused, true);
+    else if (action == MP_ACT_RESUME) set_flag(&s_paused, false);
+    else if (action == MP_ACT_MUTE) set_flag(&s_muted, true);
+    else if (action == MP_ACT_UNMUTE) set_flag(&s_muted, false);
     else if (action == MP_ACT_STOP) s_session_run = false;
     else if (action == MP_ACT_PROVISION) {
         app_net_stop();
@@ -247,7 +315,7 @@ static void apply_action(mp_action_t action) {
         app_net_start_sta(s_cfg.ssid, s_cfg.pass);
     } else if (action == MP_ACT_TEST_PUSH) {
         if (feishu_pusher_once(&s_cfg, "会议纪要 MemoPass 测试") == ESP_OK) {
-            snprintf(s_detail, sizeof(s_detail), "测试已发送");
+            set_detail_text("测试已发送");
         } else {
             set_detail(MP_ERR_FEISHU);
         }
@@ -256,12 +324,33 @@ static void apply_action(mp_action_t action) {
         app_config_clear();
         esp_restart();
     } else if (action == MP_ACT_RETRY_PUSH) {
-        s_fsm.result_ok = feishu_pusher_once(&s_cfg, s_detail[0] ? s_detail : "会议纪要") == ESP_OK;
+        char detail[sizeof(s_detail)];
+        state_lock();
+        snprintf(detail, sizeof(detail), "%s", s_detail[0] ? s_detail : "会议纪要");
+        state_unlock();
+        bool ok = feishu_pusher_once(&s_cfg, detail) == ESP_OK;
+        state_lock();
+        s_fsm.result_ok = ok;
+        state_unlock();
     }
     if (action == MP_ACT_REDRAW || action == MP_ACT_START || action == MP_ACT_STOP ||
         action == MP_ACT_PROVISION || action == MP_ACT_LEAVE_PROVISION) {
         refresh_ui();
     }
+}
+
+static mp_action_t fsm_input(mp_input_t which) {
+    state_lock();
+    mp_action_t action = meeting_fsm_input(&s_fsm, which);
+    state_unlock();
+    return action;
+}
+
+static mp_screen_t fsm_screen(void) {
+    state_lock();
+    mp_screen_t screen = s_fsm.screen;
+    state_unlock();
+    return screen;
 }
 
 static void input_task(void *arg) {
@@ -271,37 +360,49 @@ static void input_task(void *arg) {
         if (xQueueReceive(s_input_queue, &input, pdMS_TO_TICKS(100)) == pdTRUE) {
             mp_input_t which = 0;
             if (input.btn == BSP_BTN_OK && input.event == BSP_BTN_PRESS) {
+                state_lock();
                 s_holding = true;
                 s_hold_fired = false;
                 s_hold_start = esp_timer_get_time();
+                state_unlock();
             } else if (input.btn == BSP_BTN_OK && input.event == BSP_BTN_RELEASE) {
+                state_lock();
                 uint32_t held = (uint32_t)((esp_timer_get_time() - s_hold_start) / 1000);
                 s_holding = false;
                 if (!s_hold_fired) which = meeting_fsm_hold_fires(held) ? MP_IN_OK_HOLD : MP_IN_OK;
+                state_unlock();
             } else if (input.event == BSP_BTN_CLICK && input.btn == BSP_BTN_UP) {
                 which = MP_IN_UP;
             } else if (input.event == BSP_BTN_CLICK && input.btn == BSP_BTN_DOWN) {
                 which = MP_IN_DOWN;
             }
-            if (which) apply_action(meeting_fsm_input(&s_fsm, which));
+            if (which) apply_action(fsm_input(which));
         }
+        mp_action_t hold_action = MP_ACT_NONE;
+        bool hold_hit = false;
+        state_lock();
         if (s_holding && !s_hold_fired) {
             uint32_t held = (uint32_t)((esp_timer_get_time() - s_hold_start) / 1000);
             if (meeting_fsm_hold_fires(held) && s_fsm.screen == MP_SCR_RECORD) {
                 s_hold_fired = true;
                 s_holding = false;
-                apply_action(meeting_fsm_input(&s_fsm, MP_IN_OK_HOLD));
+                hold_action = meeting_fsm_input(&s_fsm, MP_IN_OK_HOLD);
+                hold_hit = true;
             }
         }
-        if (s_fsm.screen == MP_SCR_RECORD || s_fsm.screen == MP_SCR_RESULT) {
-            apply_action(meeting_fsm_input(&s_fsm, MP_IN_TICK_100MS));
+        state_unlock();
+        if (hold_hit) apply_action(hold_action);
+        if (fsm_screen() == MP_SCR_RECORD || fsm_screen() == MP_SCR_RESULT) {
+            apply_action(fsm_input(MP_IN_TICK_100MS));
         }
-        if (s_fsm.screen == MP_SCR_RECORD) refresh_ui();
+        if (fsm_screen() == MP_SCR_RECORD || s_ui_dirty) refresh_ui();
     }
 }
 
 void app_main(void) {
     ESP_LOGI(TAG, "MemoPass 启动");
+    s_state_mu = xSemaphoreCreateRecursiveMutex();
+    if (!s_state_mu) ESP_LOGE(TAG, "state mutex alloc failed");
     const uint32_t wake_causes = esp_sleep_get_wakeup_causes();
     if (wake_causes & (1u << ESP_SLEEP_WAKEUP_GPIO)) {
         key_guard_arm(&s_key_guard, esp_timer_get_time(), KEY_GUARD_MAX_US);
