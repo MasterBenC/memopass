@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "app_config.h"
+
 #define PORTAL_SSID_MAX 32
 #define PORTAL_PASS_MAX 64
 #define PORTAL_FIELD_MAX 220
@@ -30,6 +32,11 @@ typedef struct {
 /* application/x-www-form-urlencoded. Unknown keys are ignored.
  * Returns 0 on a well-formed body, -1 on malformed percent-encoding. */
 int portal_form_parse(const char *body, size_t len, portal_form_t *out);
+
+/* Merges a parsed form into an existing config. A blank text field keeps the
+ * saved value (sensitive fields pass/access/apikey/secret included); a
+ * non-blank one replaces it. segment_min and api_key_mode always follow the form. */
+void portal_form_merge(const portal_form_t *form, app_config_t *cfg);
 
 #if defined(ESP_PLATFORM)
 #include "esp_err.h"

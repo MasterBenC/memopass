@@ -1,6 +1,9 @@
 #include "portal_server.h"
 
+#include "app_config.h"
+
 #include <ctype.h>
+#include <stdio.h>
 #include <string.h>
 
 static int hex_nibble(char c) {
@@ -91,4 +94,26 @@ int portal_form_parse(const char *body, size_t len, portal_form_t *out) {
         take(out, key, val);
     }
     return 0;
+}
+
+/* One rule for every text field: a blank form value keeps what is already
+ * saved, a non-blank value replaces it. This matters most for the sensitive
+ * fields (pass, access, apikey, secret), which the page never echoes back, so
+ * a blank there means "unchanged", never "erase". */
+static void keep_or_set(char *dst, size_t cap, const char *src) {
+    if (src && src[0]) snprintf(dst, cap, "%s", src);
+}
+
+void portal_form_merge(const portal_form_t *form, app_config_t *cfg) {
+    keep_or_set(cfg->ssid, sizeof(cfg->ssid), form->ssid);
+    keep_or_set(cfg->app_id, sizeof(cfg->app_id), form->app_id);
+    keep_or_set(cfg->webhook, sizeof(cfg->webhook), form->webhook);
+    keep_or_set(cfg->resource, sizeof(cfg->resource), form->resource);
+    /* Sensitive fields. */
+    keep_or_set(cfg->pass, sizeof(cfg->pass), form->pass);
+    keep_or_set(cfg->access, sizeof(cfg->access), form->access);
+    keep_or_set(cfg->apikey, sizeof(cfg->apikey), form->apikey);
+    keep_or_set(cfg->secret, sizeof(cfg->secret), form->secret);
+    cfg->segment_min = (uint8_t)app_config_segment_min(form->segment_min);
+    cfg->api_key_mode = form->api_key_mode;
 }

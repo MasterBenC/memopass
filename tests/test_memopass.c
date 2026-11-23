@@ -298,6 +298,45 @@ static void test_portal_and_config(void) {
     assert(strcmp(app_config_resource(&cfg), APP_RESOURCE_DEFAULT) == 0);
 }
 
+static void test_portal_merge_keeps_secrets(void) {
+    portal_form_t form;
+    app_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.ssid, sizeof(cfg.ssid), "Office");
+    snprintf(cfg.pass, sizeof(cfg.pass), "old-pass");
+    snprintf(cfg.app_id, sizeof(cfg.app_id), "123456");
+    snprintf(cfg.access, sizeof(cfg.access), "old-access");
+    snprintf(cfg.apikey, sizeof(cfg.apikey), "old-apikey");
+    snprintf(cfg.secret, sizeof(cfg.secret), "old-secret");
+    snprintf(cfg.resource, sizeof(cfg.resource), "res.old");
+    snprintf(cfg.webhook, sizeof(cfg.webhook), "https://open.feishu.cn/open-apis/bot/v2/hook/abc");
+    /* Every field present but blank: nothing saved may be erased. */
+    const char *blank = "ssid=&pass=&app_id=&access=&apikey=&secret=&resource=&webhook="
+                        "&segment=5&auth=apikey";
+    assert(portal_form_parse(blank, strlen(blank), &form) == 0);
+    portal_form_merge(&form, &cfg);
+    assert(strcmp(cfg.ssid, "Office") == 0);
+    assert(strcmp(cfg.pass, "old-pass") == 0);
+    assert(strcmp(cfg.app_id, "123456") == 0);
+    assert(strcmp(cfg.access, "old-access") == 0);
+    assert(strcmp(cfg.apikey, "old-apikey") == 0);
+    assert(strcmp(cfg.secret, "old-secret") == 0);
+    assert(strcmp(cfg.resource, "res.old") == 0);
+    assert(strstr(cfg.webhook, "hook/abc") != NULL);
+    assert(cfg.segment_min == 5 && cfg.api_key_mode);
+    /* Non-blank values replace. */
+    const char *full = "pass=new-pass&access=new-access&apikey=new-apikey&secret=new-secret"
+                       "&segment=1&auth=app";
+    assert(portal_form_parse(full, strlen(full), &form) == 0);
+    portal_form_merge(&form, &cfg);
+    assert(strcmp(cfg.pass, "new-pass") == 0);
+    assert(strcmp(cfg.access, "new-access") == 0);
+    assert(strcmp(cfg.apikey, "new-apikey") == 0);
+    assert(strcmp(cfg.secret, "new-secret") == 0);
+    assert(strcmp(cfg.ssid, "Office") == 0);
+    assert(cfg.segment_min == 1 && !cfg.api_key_mode);
+}
+
 static void test_asr(void) {
     char headers[320];
     const uint8_t payload[] = {'A', 'B'};
@@ -334,6 +373,7 @@ int main(void) {
     test_feishu();
     test_feishu_escape_boundary();
     test_portal_and_config();
+    test_portal_merge_keeps_secrets();
     test_asr();
     puts("memopass host tests: PASS");
     return 0;
