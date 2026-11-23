@@ -112,6 +112,164 @@ static void test_feishu(void) {
     assert(feishu_utf8_cut("甲乙丙", 9, 4) == 3);
 }
 
+/* Decodes the JSON string that starts right after `key` in body (the opening
+ * quote included in key). Returns decoded length, or -1 on a malformed escape
+ * or a missing closing quote. Supports the escapes feishu_format emits. */
+static int json_decode_after(const char *body, const char *key, char *out, size_t cap) {
+    const char *p = strstr(body, key);
+    size_t o = 0;
+    if (!p) return -1;
+    p += strlen(key);
+    while (*p && *p != '"') {
+        char c = *p++;
+        if (c == '\\') {
+            char e = *p++;
+            if (e == 'n') c = '\n';
+            else if (e == 'r') c = '\r';
+            else if (e == 't') c = '\t';
+            else if (e == '"' || e == '\\') c = e;
+            else if (e == 'u') {
+                unsigned v = 0;
+                for (int k = 0; k < 4; k++) {
+                    char h = *p++;
+                    v <<= 4;
+                    if (h >= '0' && h <= '9') v |= (unsigned)(h - '0');
+                    else if (h >= 'a' && h <= 'f') v |= (unsigned)(h - 'a' + 10);
+                    else return -1;
+                }
+                if (v >= 0x20) return -1;
+                c = (char)v;
+            } else {
+                return -1;
+            }
+        } else if ((unsigned char)c < 0x20) {
+            return -1;
+        }
+        if (o + 1 >= cap) return -1;
+        out[o++] = c;
+    }
+    if (*p != '"') return -1;
+    out[o] = '\0';
+    return (int)o;
+}
+
+/* Builds len bytes dense in quotes, newlines, backslashes, control bytes and
+ * multi-byte UTF-8 so escape growth is between 1x and 6x per byte. */
+static size_t dense_escape_text(char *out, size_t len) {
+    static const char *units[] = {"\"", "\n", "\\", "\x01", "\x1f", "\t", "\r",
+                                  "中", "a", "\x7f", "😀", "\x02"};
+    size_t n = 0;
+    for (size_t i = 0; n < len; i++) {
+        const char *u = units[i % (sizeof(units) / sizeof(units[0]))];
+        size_t ul = strlen(u);
+        if (n + ul > len) break;
+        memcpy(out + n, u, ul);
+        n += ul;
+    }
+    return n;
+}
+
+static void check_escaped_body(feishu_kind_t kind, const feishu_job_t *job,
+                               char *body, size_t cap) {
+    static char decoded[8192];
+    const char *key = kind == FEISHU_KIND_BOT ? "\"content\":{\"text\":\"" : "\"text\":\"";
+    const char *tail = kind == FEISHU_KIND_BOT ? "\"}}" : "\"}";
+    memset(body, 0x5a, cap);
+    int n = feishu_format(kind, job, body, cap);
+    assert(n > 0);
+    assert((size_t)n < cap);
+    assert(body[n] == '\0');
+    assert((size_t)n == strlen(body));
+    if (kind == FEISHU_KIND_BOT) assert(n <= 20000);
+    assert((size_t)n >= strlen(tail));
+    assert(strcmp(body + n - strlen(tail), tail) == 0);
+    int d = json_decode_after(body, key, decoded, sizeof(decoded));
+    assert(d >= 0);
+    assert(mp_utf8_valid(decoded, (size_t)d));
+    if (kind == FEISHU_KIND_BOT) {
+        const char *after = strchr(decoded, '\n');
+        assert(strncmp(decoded, "会议纪要\n#", strlen("会议纪要\n#")) == 0);
+        assert(after);
+        after = strchr(after + 1, '\n');
+        assert(after);
+        after++;
+        size_t got = (size_t)d - (size_t)(after - decoded);
+        assert(got <= job->text_len);
+        assert(memcmp(after, job->text, got) == 0);
+    } else {
+        assert((size_t)d <= job->text_len);
+        assert(memcmp(decoded, job->text, (size_t)d) == 0);
+    }
+}
+
+static void test_feishu_escape_boundary(void) {
+    static char text[2600];
+    static char body[4096];
+    feishu_job_t job;
+    size_t len = dense_escape_text(text, 2500);
+    memset(&job, 0, sizeof(job));
+    job.meeting_id = "ab12cd34";
+    job.segment = 7;
+    job.text = text;
+    job.text_len = len;
+    /* 2500 dense bytes can escape to well over 4096; must truncate, not fail. */
+    check_escaped_body(FEISHU_KIND_BOT, &job, body, sizeof(body));
+    assert(strlen(body) > sizeof(body) - 16);
+    check_escaped_body(FEISHU_KIND_BITABLE, &job, body, sizeof(body));
+    assert(strlen(body) > sizeof(body) - 16);
+    job.with_sign = true;
+    job.unix_time = 1599360473;
+    job.secret = "demo";
+    check_escaped_body(FEISHU_KIND_BOT, &job, body, sizeof(body));
+    job.with_sign = false;
+    /* Sweep caps across the escape-width boundaries near the upper limit. */
+    for (size_t cap = sizeof(body) - 24; cap <= sizeof(body); cap++) {
+        check_escaped_body(FEISHU_KIND_BOT, &job, body, cap);
+        check_escaped_body(FEISHU_KIND_BITABLE, &job, body, cap);
+    }
+    for (size_t cap = 120; cap <= 200; cap++) {
+        check_escaped_body(FEISHU_KIND_BOT, &job, body, cap);
+        check_escaped_body(FEISHU_KIND_BITABLE, &job, body, cap);
+    }
+    /* Pure 6x control bytes and pure 2x quotes/backslashes/newlines. */
+    memset(text, 0x01, 2500);
+    job.text_len = 2500;
+    check_escaped_body(FEISHU_KIND_BOT, &job, body, sizeof(body));
+    check_escaped_body(FEISHU_KIND_BITABLE, &job, body, sizeof(body));
+    for (size_t i = 0; i < 2500; i++) text[i] = "\"\\\n"[i % 3];
+    check_escaped_body(FEISHU_KIND_BOT, &job, body, sizeof(body));
+    check_escaped_body(FEISHU_KIND_BITABLE, &job, body, sizeof(body));
+    /* A short dense text that fits must come through whole. */
+    job.text_len = dense_escape_text(text, 200);
+    check_escaped_body(FEISHU_KIND_BOT, &job, body, sizeof(body));
+    {
+        static char decoded[1024];
+        int d = json_decode_after(body, "\"content\":{\"text\":\"", decoded, sizeof(decoded));
+        const char *after = strchr(strchr(decoded, '\n') + 1, '\n') + 1;
+        assert((size_t)d - (size_t)(after - decoded) == job.text_len);
+    }
+    /* Invalid UTF-8 stops at the last valid character instead of failing. */
+    memcpy(text, "ok\xe4\xb8", 4);
+    job.text_len = 4;
+    check_escaped_body(FEISHU_KIND_BOT, &job, body, sizeof(body));
+    assert(strstr(body, "ok\"}}") != NULL);
+    /* Exactly fitting text: the tail fits with zero spare bytes. */
+    memset(&job, 0, sizeof(job));
+    job.meeting_id = "ab12cd34";
+    job.text = "";
+    job.text_len = 0;
+    int base = feishu_format(FEISHU_KIND_BOT, &job, body, sizeof(body));
+    assert(base > 0);
+    memset(text, 'x', 40);
+    job.text = text;
+    job.text_len = 40;
+    assert(feishu_format(FEISHU_KIND_BOT, &job, body, (size_t)base + 41) == base + 40);
+    assert(feishu_format(FEISHU_KIND_BOT, &job, body, (size_t)base + 40) == base + 39);
+    text[39] = '"';
+    assert(feishu_format(FEISHU_KIND_BOT, &job, body, (size_t)base + 41) == base + 39);
+    assert(strstr(body, "x\"}}") != NULL);
+}
+
 static void test_portal_and_config(void) {
     portal_form_t form;
     app_config_t cfg;
@@ -174,6 +332,7 @@ int main(void) {
     test_fsm();
     test_text();
     test_feishu();
+    test_feishu_escape_boundary();
     test_portal_and_config();
     test_asr();
     puts("memopass host tests: PASS");

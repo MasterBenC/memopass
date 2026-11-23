@@ -244,6 +244,63 @@ static int append_escaped(char *out, size_t cap, size_t *used,
     return 0;
 }
 
+/* JSON escape of one byte. Returns the escaped length (1, 2 or 6). */
+static size_t escape_byte(unsigned char c, char buf[8]) {
+    if (c == '"' || c == '\\') {
+        buf[0] = '\\';
+        buf[1] = (char)c;
+        return 2;
+    }
+    if (c == '\n' || c == '\r' || c == '\t') {
+        buf[0] = '\\';
+        buf[1] = c == '\n' ? 'n' : c == '\r' ? 'r' : 't';
+        return 2;
+    }
+    if (c < 0x20) {
+        snprintf(buf, 8, "\\u%04x", c);
+        return 6;
+    }
+    buf[0] = (char)c;
+    return 1;
+}
+
+/* Byte length of the single well-formed UTF-8 character at s, or 0. */
+static size_t utf8_char_len(const char *s, size_t len) {
+    unsigned char lead = (unsigned char)s[0];
+    size_t need = lead < 0x80 ? 1 : (lead & 0xE0) == 0xC0 ? 2 :
+                  (lead & 0xF0) == 0xE0 ? 3 : (lead & 0xF8) == 0xF0 ? 4 : 0;
+    if (need == 0 || need > len) return 0;
+    return mp_utf8_fit(s, need, need) == need ? need : 0;
+}
+
+/* Escapes text one UTF-8 character at a time and stops before the first
+ * character whose escaped form would push *used past limit (limit < cap).
+ * Never fails and never leaves a split character or a half escape behind.
+ * Returns the number of source bytes consumed. */
+static size_t append_escaped_fit(char *out, size_t cap, size_t *used, size_t limit,
+                                 const char *s, size_t len) {
+    size_t i = 0;
+    if (limit >= cap) limit = cap - 1;
+    while (i < len && *used < limit) {
+        size_t clen = utf8_char_len(s + i, len - i);
+        char buf[8];
+        size_t elen;
+        if (clen == 0) break;
+        if (clen == 1) {
+            elen = escape_byte((unsigned char)s[i], buf);
+        } else {
+            memcpy(buf, s + i, clen);
+            elen = clen;
+        }
+        if (elen > limit - *used) break;
+        memcpy(out + *used, buf, elen);
+        *used += elen;
+        i += clen;
+    }
+    out[*used] = '\0';
+    return i;
+}
+
 int feishu_format(feishu_kind_t kind, const feishu_job_t *job, char *out, size_t cap) {
     size_t used = 0;
     size_t text_len;
@@ -275,9 +332,9 @@ int feishu_format(feishu_kind_t kind, const feishu_job_t *job, char *out, size_t
             return -1;
         }
         if (append_escaped(out, cap, &used, prefix, (size_t)pn) != 0) return -1;
-        if (used + 4 > limit) return -1;
-        text_len = feishu_utf8_cut(text, text_len, limit - used - 4);
-        if (append_escaped(out, cap, &used, text, text_len) != 0) return -1;
+        /* Reserve the closing "}} so escape growth can only shorten the text. */
+        if (used + 3 > limit) return -1;
+        append_escaped_fit(out, cap, &used, limit - 3, text, text_len);
         if (append(out, cap, &used, "\"}}") != 0) return -1;
         if (used > 20000) return -1;
         return (int)used;
@@ -290,7 +347,10 @@ int feishu_format(feishu_kind_t kind, const feishu_job_t *job, char *out, size_t
                  job->segment, job->is_final ? "true" : "false", job->duration_sec);
         if (append(out, cap, &used, tail) != 0) return -1;
     }
-    if (append_json_str(out, cap, &used, text, text_len) != 0) return -1;
-    if (append(out, cap, &used, "}") != 0) return -1;
+    /* Same safe truncation for the bitable body: reserve the closing "} */
+    if (append(out, cap, &used, "\"") != 0) return -1;
+    if (used + 2 > cap - 1) return -1;
+    append_escaped_fit(out, cap, &used, cap - 1 - 2, text, text_len);
+    if (append(out, cap, &used, "\"}") != 0) return -1;
     return (int)used;
 }
