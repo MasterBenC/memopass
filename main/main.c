@@ -29,6 +29,7 @@
 #include "lvgl.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -49,6 +50,7 @@ static app_config_t s_cfg;
 static volatile bool s_paused;
 static volatile bool s_muted;
 static volatile bool s_session_run;
+static TaskHandle_t s_session_task;
 static volatile bool s_holding;
 static volatile int64_t s_hold_start;
 static volatile bool s_hold_fired;
@@ -172,7 +174,7 @@ static void refresh_ui(void) {
     }
     case MP_SCR_RESULT:
         memopass_ui_result(fsm.result_ok, detail, (int)(elapsed_ms / 1000),
-                           segments, fsm.detail_on);
+                           segments, fsm.detail_on, fsm.result_pending);
         break;
     case MP_SCR_SETTINGS:
         memopass_ui_settings(fsm.settings_i, fsm.beep, fsm.factory_armed);
@@ -186,28 +188,41 @@ static void refresh_ui(void) {
 }
 
 static void submit_text(const char *text, size_t len, bool final) {
-    feishu_seg_t seg;
+    feishu_seg_t *seg;
     size_t cut = mp_utf8_fit(text, len, FEISHU_PUSH_TEXT);
     if (!cut && !final) return;
-    memset(&seg, 0, sizeof(seg));
+    seg = (feishu_seg_t *)calloc(1, sizeof(*seg));
+    if (!seg) {
+        ESP_LOGE(TAG, "submit_text alloc failed");
+        if (final) set_detail(MP_ERR_FEISHU);
+        return;
+    }
     state_lock();
-    snprintf(seg.meeting_id, sizeof(seg.meeting_id), "%s", s_meeting_id);
-    seg.segment = ++s_segments;
-    seg.duration_sec = (int)(s_elapsed_ms / 1000);
+    snprintf(seg->meeting_id, sizeof(seg->meeting_id), "%s", s_meeting_id);
+    seg->segment = ++s_segments;
+    seg->duration_sec = (int)(s_elapsed_ms / 1000);
     state_unlock();
-    seg.is_final = final;
-    seg.text_len = cut;
-    if (cut) memcpy(seg.text, text, cut);
-    if (!feishu_pusher_submit(&seg) && final) set_detail(MP_ERR_FEISHU);
+    seg->is_final = final;
+    seg->text_len = cut;
+    if (cut) memcpy(seg->text, text, cut);
+    if (!feishu_pusher_submit(seg) && final) set_detail(MP_ERR_FEISHU);
+    free(seg);
 }
 
 static void session_task(void *arg) {
     (void)arg;
-    char snap[2200];
+    const size_t snap_cap = 2200;
+    char *snap = (char *)malloc(snap_cap);
     uint32_t seg_ms = 0;
     bool mark = false;
+    int segment_min;
+    if (!snap) {
+        ESP_LOGE(TAG, "session snap alloc failed");
+        set_detail_text("内存不足，请再试一次");
+        s_session_run = false;
+    }
     state_lock();
-    const int segment_min = s_cfg.segment_min;
+    segment_min = s_cfg.segment_min;
     state_unlock();
     while (s_session_run) {
         size_t n = 0;
@@ -215,7 +230,7 @@ static void session_task(void *arg) {
         if (fail == 401) set_detail(MP_ERR_AUTH);
         else if (fail == 45000030) set_detail(MP_ERR_RESOURCE);
         else if (fail == 8) set_detail(MP_ERR_NET);
-        if (volc_asr_copy(snap, sizeof(snap), &n) && n) {
+        if (snap && volc_asr_copy(snap, snap_cap, &n) && n) {
             if (mark) {
                 submit_text("[重点]", strlen("[重点]"), false);
                 mark = false;
@@ -238,9 +253,11 @@ static void session_task(void *arg) {
         }
         state_unlock();
     }
-    {
+    if (snap) {
         size_t n = 0;
-        if (volc_asr_copy(snap, sizeof(snap), &n)) submit_text(snap, n, true);
+        if (volc_asr_copy(snap, snap_cap, &n)) submit_text(snap, n, true);
+        free(snap);
+        snap = NULL;
     }
     audio_pipeline_stop();
     volc_asr_close();
@@ -260,16 +277,30 @@ static void session_task(void *arg) {
         app_config_hist_push(&item);
         state_lock();
         meeting_fsm_push_done(&s_fsm, item.pushed);
-        if (!item.pushed && !s_detail[0]) set_detail(MP_ERR_FEISHU);
+        if (!item.pushed && !s_detail[0]) {
+            set_detail(s_segments == 0 ? MP_ERR_EMPTY : MP_ERR_FEISHU);
+        }
         state_unlock();
         /* The result screen must show the final push state. */
         s_ui_dirty = true;
     }
+    s_session_task = NULL;
     vTaskDelete(NULL);
 }
 
 static void start_session(void) {
-    uint32_t rnd = esp_random();
+    uint32_t rnd;
+    for (int i = 0; i < 2400 && s_session_task; i++) vTaskDelay(pdMS_TO_TICKS(25));
+    if (s_session_task) {
+        ESP_LOGW(TAG, "previous session still running, not starting another");
+        state_lock();
+        meeting_fsm_return_home(&s_fsm);
+        state_unlock();
+        s_ui_dirty = true;
+        refresh_ui();
+        return;
+    }
+    rnd = esp_random();
     state_lock();
     snprintf(s_meeting_id, sizeof(s_meeting_id), "%08lx", (unsigned long)rnd);
     s_segments = 0;
@@ -291,7 +322,20 @@ static void start_session(void) {
     volc_asr_open(&s_cfg, s_pcm_used, s_pcm_free);
     audio_pipeline_start(s_pcm_used, s_pcm_free, &s_paused, &s_muted);
     s_session_run = true;
-    xTaskCreate(session_task, "mp_session", 6144, NULL, 5, NULL);
+    if (xTaskCreate(session_task, "mp_session", 8192, NULL, 5, &s_session_task) != pdPASS) {
+        s_session_task = NULL;
+        s_session_run = false;
+        ESP_LOGE(TAG, "session task create failed");
+        set_detail_text("内存不足，请再试一次");
+        audio_pipeline_stop();
+        volc_asr_close();
+        feishu_pusher_stop();
+        state_lock();
+        meeting_fsm_push_done(&s_fsm, false);
+        state_unlock();
+        s_ui_dirty = true;
+        refresh_ui();
+    }
 }
 
 static void set_flag(volatile bool *flag, bool value) {
@@ -325,16 +369,20 @@ static void apply_action(mp_action_t action) {
         esp_restart();
     } else if (action == MP_ACT_RETRY_PUSH) {
         char detail[sizeof(s_detail)];
+        bool ok;
         state_lock();
         snprintf(detail, sizeof(detail), "%s", s_detail[0] ? s_detail : "会议纪要");
         state_unlock();
-        bool ok = feishu_pusher_once(&s_cfg, detail) == ESP_OK;
+        ok = feishu_pusher_once(&s_cfg, detail) == ESP_OK;
         state_lock();
         s_fsm.result_ok = ok;
+        s_fsm.result_pending = false;
         state_unlock();
+        s_ui_dirty = true;
     }
     if (action == MP_ACT_REDRAW || action == MP_ACT_START || action == MP_ACT_STOP ||
-        action == MP_ACT_PROVISION || action == MP_ACT_LEAVE_PROVISION) {
+        action == MP_ACT_PROVISION || action == MP_ACT_LEAVE_PROVISION ||
+        action == MP_ACT_RETRY_PUSH) {
         refresh_ui();
     }
 }

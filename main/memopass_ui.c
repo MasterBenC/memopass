@@ -263,17 +263,20 @@ void memopass_ui_record(const meeting_fsm_t *st, const char *timer, const char *
     if (lv_screen_active() != s_rec) lv_screen_load(s_rec);
 }
 
-void memopass_ui_result(bool ok, const char *detail, int duration_sec, int segments, bool detail_on) {
+void memopass_ui_result(bool ok, const char *detail, int duration_sec, int segments,
+                       bool detail_on, bool pending) {
     char line[48];
     int mm = duration_sec / 60;
     int ss = duration_sec % 60;
-    lv_label_set_text(s_result_title, ok ? "已同步至飞书" : "同步失败");
+    lv_label_set_text(s_result_title, pending ? "正在同步…" : (ok ? "已同步至飞书" : "同步失败"));
     snprintf(line, sizeof(line), "时长 %02d:%02d · 共 %d 段", mm, ss, segments);
     lv_label_set_text(s_result_sub, line);
-    if (!ok && detail_on && detail) lv_label_set_text(s_result_hint, detail);
+    if (pending) lv_label_set_text(s_result_hint, "请稍候");
+    else if (!ok && detail_on && detail) lv_label_set_text(s_result_hint, detail);
     else if (ok) lv_label_set_text(s_result_hint, "3秒后自动返回");
     else lv_label_set_text(s_result_hint, "确认:重试");
-    lv_label_set_text(s_result_guide, ok ? "确认:回主页" : "上:放弃 | 确认:重试 | 下:详情");
+    if (pending) lv_label_set_text(s_result_guide, "正在同步");
+    else lv_label_set_text(s_result_guide, ok ? "确认:回主页" : "上:放弃 | 确认:重试 | 下:详情");
     if (lv_screen_active() != s_result) lv_screen_load(s_result);
 }
 

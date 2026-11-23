@@ -15,6 +15,7 @@ static mp_action_t go(meeting_fsm_t *st, mp_screen_t screen) {
     st->factory_armed = false;
     st->detail_on = false;
     st->return_age_ms = 0;
+    st->result_pending = false;
     return MP_ACT_REDRAW;
 }
 
@@ -29,11 +30,25 @@ static mp_action_t try_start(meeting_fsm_t *st) {
     return MP_ACT_START;
 }
 
+void meeting_fsm_return_home(meeting_fsm_t *st) {
+    if (!st) return;
+    st->recording = false;
+    st->paused = false;
+    st->muted = false;
+    st->mark_on = false;
+    st->result_pending = false;
+    st->detail_on = false;
+    st->factory_armed = false;
+    st->return_age_ms = 0;
+    st->screen = MP_SCR_HOME;
+}
+
 void meeting_fsm_push_done(meeting_fsm_t *st, bool ok) {
     if (!st) return;
     st->recording = false;
     st->paused = false;
     st->result_ok = ok;
+    st->result_pending = false;
     st->return_age_ms = 0;
     st->detail_on = false;
     st->screen = MP_SCR_RESULT;
@@ -48,7 +63,7 @@ mp_action_t meeting_fsm_input(meeting_fsm_t *st, mp_input_t input) {
             else st->mark_age_ms = (uint16_t)(st->mark_age_ms + 100u);
             return MP_ACT_REDRAW;
         }
-        if (st->screen == MP_SCR_RESULT && st->result_ok) {
+        if (st->screen == MP_SCR_RESULT && st->result_ok && !st->result_pending) {
             st->return_age_ms = (uint16_t)(st->return_age_ms + 100u);
             if (st->return_age_ms >= MP_RESULT_RETURN_MS) return go(st, MP_SCR_HOME);
         }
@@ -84,12 +99,14 @@ mp_action_t meeting_fsm_input(meeting_fsm_t *st, mp_input_t input) {
         if (input == MP_IN_OK_HOLD) {
             st->recording = false;
             st->screen = MP_SCR_RESULT;
-            st->result_ok = false;
+            st->result_pending = true;
             st->return_age_ms = 0;
+            st->detail_on = false;
             return MP_ACT_STOP;
         }
         return MP_ACT_NONE;
     case MP_SCR_RESULT:
+        if (st->result_pending) return MP_ACT_NONE;
         if (st->result_ok) {
             if (input == MP_IN_OK) return go(st, MP_SCR_HOME);
             return MP_ACT_NONE;
@@ -143,6 +160,8 @@ const char *meeting_fsm_error_text(mp_err_t err) {
         return "请在火山引擎开通流式语音识别服务";
     case MP_ERR_FEISHU:
         return "飞书地址不可用，请检查机器人设置";
+    case MP_ERR_EMPTY:
+        return "没有识别到内容，请再录一段";
     case MP_ERR_NET:
     default:
         return "网络已断开，恢复后将自动继续";
@@ -162,6 +181,7 @@ const char *meeting_fsm_key_guide(const meeting_fsm_t *st) {
         if (st->muted) return "上:标重点 | 确认:暂停 | 下:取消静音";
         return "上:标重点 | 确认:暂停 | 下:静音";
     case MP_SCR_RESULT:
+        if (st->result_pending) return "正在同步";
         return st->result_ok ? "确认:回主页" : "上:放弃 | 确认:重试 | 下:详情";
     case MP_SCR_SETTINGS:
         return "上:上移 | 确认:执行 | 下:下移";

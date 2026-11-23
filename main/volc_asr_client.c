@@ -152,7 +152,7 @@ static bool connect_once_inner(void) {
     esp_websocket_client_config_t cfg = {
         .uri = ASR_URI,
         .buffer_size = 2048,
-        .task_stack = 5120,
+        .task_stack = 8192,
         .headers = s_headers,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .disable_auto_reconnect = true,

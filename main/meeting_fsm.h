@@ -51,6 +51,7 @@ typedef enum {
     MP_ERR_RESOURCE,
     MP_ERR_FEISHU,
     MP_ERR_NET,
+    MP_ERR_EMPTY,
 } mp_err_t;
 
 typedef struct {
@@ -64,6 +65,7 @@ typedef struct {
     uint8_t settings_i;
     bool factory_armed;
     bool result_ok;
+    bool result_pending;
     bool detail_on;
     uint16_t return_age_ms;
     bool beep;
@@ -72,6 +74,7 @@ typedef struct {
 void meeting_fsm_init(meeting_fsm_t *st, bool configured);
 mp_action_t meeting_fsm_input(meeting_fsm_t *st, mp_input_t input);
 void meeting_fsm_push_done(meeting_fsm_t *st, bool ok);
+void meeting_fsm_return_home(meeting_fsm_t *st);
 
 const char *meeting_fsm_error_text(mp_err_t err);
 const char *meeting_fsm_key_guide(const meeting_fsm_t *st);
